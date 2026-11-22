@@ -1,0 +1,206 @@
+Sony Alpha trigger (camera_trigger_capture, PTP_OC_SONY_SDIO_ControlDevice branch) pressed like a finger: half-press,
+WAIT for focus (AFStatus 0xC223 = 2 or 0xD213 in {2,3} read at least 100 ms after the press; at most 2000 ms; manual
+focus = 100 ms), full-press, HOLD it until the camera registers the shot (0xD215 >= 0x8000, or ObjectAdded 0xC201 /
+CapturedEvent 0xC206; at least 150 ms, at most 1000 ms), then release S2 and S1. Every event that is not an AF one is
+put back in the queue, in order, for camera_wait_for_event. Log lines "sony trigger: ..." with the timings.
+Why: upstream (2.5.34 and master) presses S2 23 ms after S1 and releases as soon as 0xD213 reads 2 — measured on an
+ILCE-1 (Prism, 30/09-01/10/2026, PTP through ImageCaptureCore): 0xD213 = 2 after 43 ms was the stale value of the
+previous lock, release at 66 ms, the AFStatus events (1 x4, then 2) arrived AFTER the release and the body did not
+shoot (0xD215 stayed 0 for 30 s; one shot in ten). The FX30 shot only because its AF is faster.
+Remove when libgphoto2 upstream changes this sequence.
+--- a/camlibs/ptp2/library.c
++++ b/camlibs/ptp2/library.c
+@@ -6456,64 +6456,158 @@
+ 	if (	(params->deviceinfo.VendorExtensionID == PTP_VENDOR_SONY) &&
+ 		ptp_operation_issupported(params, PTP_OC_SONY_SDIO_ControlDevice)
+ 	) {
++		/* Prism [PR-MAC-154]: press the shutter like a finger. Half-press, WAIT for focus, full-press, HOLD it until
++		 * the camera registers the shot, then release. The upstream sequence pressed S2 23 ms after S1 and released
++		 * as soon as 0xD213 read 2 (a stale value of the previous lock): a body with slower AF (ILCE-1) was still
++		 * focusing when the button was already up and did not shoot. Events that are not the AF ones are handed
++		 * back to the queue (in order) for camera_wait_for_event. */
+ 		PTPPropValue		propval;
+-		struct timeval		event_start;
++		struct timeval		press_start, full_start;
+ 		PTPContainer		event;
+ 		PTPDevicePropDesc	dpd;
++		PTPContainer		held[64];
++		unsigned int		nheld = 0, maxheld = sizeof(held)/sizeof(held[0]), i;
++		int			manual, focus_ready = 0, af_moving = 0, shot = 0;
++		uint16_t		inmem = 0, fail = PTP_RC_OK; /* ret: the function's own */
++
++		C_PTP (ptp_generic_getdevicepropdesc (params, PTP_DPC_FocusMode, &dpd));
++		manual = (dpd.CurrentValue.u16 == 1); /* 1 is Manual: no focus to wait for */
++		ptp_free_devicepropdesc (&dpd);
+ 
++		/* events queued before the press belong to the caller: keep them aside, they go back first */
++		while (nheld < maxheld && ptp_get_one_event (params, &event))
++			held[nheld++] = event;
++
+ 		/* half-press */
+ 		propval.u16 = 2;
+-		C_PTP (ptp_sony_setdevicecontrolvalueb (params, PTP_DPC_SONY_ShutterHalfRelease, &propval, PTP_DTC_UINT16));
++		ret = ptp_sony_setdevicecontrolvalueb (params, PTP_DPC_SONY_ShutterHalfRelease, &propval, PTP_DTC_UINT16);
++		if (ret != PTP_RC_OK) {
++			fail = ret;
++			goto sony_requeue;
++		}
++		press_start = time_now ();
+ 
+-		/* full-press */
+-		propval.u16 = 2;
+-		C_PTP (ptp_sony_setdevicecontrolvalueb (params, PTP_DPC_SONY_ShutterRelease, &propval, PTP_DTC_UINT16));
+-
+-		/* Wait for focus only in automatic focus mode */
+-		C_PTP (ptp_generic_getdevicepropdesc (params, PTP_DPC_FocusMode, &dpd));
+-		if (dpd.CurrentValue.u16 != 1) { /* 1 is Manual .. no need to wait there for focusing */
+-			/* Now hold down the shutter button for a bit. We probably need to hold it as long as it takes to
+-			* get focus, indicated by the 0xD213 property. But hold it for at most 1 second.
+-			*/
++		if (manual) {
++			GP_LOG_D ("sony trigger: manual focus, full-press after 100 ms");
++			while (time_since (press_start) < 100) {
++				if (ptp_check_event (params) != PTP_RC_OK)
++					break;
++				usleep (20*1000);
++			}
++		} else {
++			GP_LOG_D ("sony trigger: half-press, waiting for focus (at most 2000 ms)");
++			while (!focus_ready && time_since (press_start) < 2000) {
++				int af_done = 0;
+ 
+-			GP_LOG_D ("holding down shutterbutton");
+-			event_start = time_now();
+-			do {
+-				/* needed on older cameras like the a58, check for events ... */
+-				C_PTP (ptp_check_event (params));
+-				if (ptp_get_one_event(params, &event)) {
+-					GP_LOG_D ("during event.code=%04x Param1=%08x", event.Code, event.Param1);
+-					if (	(event.Code == PTP_EC_Sony_DevicePropChanged) &&
+-						(event.Param1 == PTP_DPC_SONY_FocusFound)
+-					) {
+-						GP_LOG_D ("SONY FocusFound change received, 0xd213... ending press");
++				ret = ptp_check_event (params);
++				if (ret != PTP_RC_OK) {
++					GP_LOG_E ("sony trigger: check_event failed 0x%04x while focusing", ret);
++					break;
++				}
++				while (nheld < maxheld && ptp_get_one_event (params, &event)) {
++					if (event.Code == PTP_EC_Sony_AFStatus) {
++						GP_LOG_D ("sony trigger: AFStatus %u after %d ms", event.Param1, time_since (press_start));
++						if (event.Param1 == 2)
++							af_done = 1;
++						else if (event.Param1 == 1)
++							af_moving = 1;
++						continue;
++					}
++					if ((event.Code == PTP_EC_Sony_DevicePropChanged) && (event.Param1 == PTP_DPC_SONY_FocusFound))
++						continue; /* re-read below */
++					held[nheld++] = event;
++				}
++				/* an AFStatus 2 counts once the AF was seen moving in this press, or after the first 100 ms */
++				if (af_done && (af_moving || time_since (press_start) >= 100)) {
++					focus_ready = 1;
++					break;
++				}
++				if (ptp_sony_getalldevicepropdesc (params) != PTP_RC_OK) /* avoid caching */
++					break;
++				if (ptp_generic_getdevicepropdesc (params, PTP_DPC_SONY_FocusFound, &dpd) == PTP_RC_OK) {
++					uint8_t	found = dpd.CurrentValue.u8;
++
++					ptp_free_devicepropdesc (&dpd);
++					/* 2 (3 on the RX0) = focus achieved; in the first 100 ms it is the value of the previous lock */
++					if ((found == 2 || found == 3) && time_since (press_start) >= 100) {
++						focus_ready = 1;
+ 						break;
+ 					}
+ 				}
++				usleep (20*1000);
++			}
++			if (focus_ready)
++				GP_LOG_D ("sony trigger: focus ready after %d ms", time_since (press_start));
++			else
++				GP_LOG_D ("sony trigger: no focus after %d ms, full-press anyway", time_since (press_start));
++		}
+ 
+-				/* Alternative code in case we miss the event */
++		/* full-press */
++		propval.u16 = 2;
++		ret = ptp_sony_setdevicecontrolvalueb (params, PTP_DPC_SONY_ShutterRelease, &propval, PTP_DTC_UINT16);
++		if (ret != PTP_RC_OK) {
++			fail = ret;
++			goto sony_release_half;
++		}
++		full_start = time_now ();
+ 
+-				C_PTP (ptp_sony_getalldevicepropdesc (params)); /* avoid caching */
+-				C_PTP (ptp_generic_getdevicepropdesc (params, PTP_DPC_SONY_FocusFound, &dpd));
+-				GP_LOG_D ("DEBUG== 0xd213 after shutter press = %d", dpd.CurrentValue.u8);
+-				/* if prop 0xd213 = 2 or 3 (for rx0), the focus seems to be achieved */
+-				if (dpd.CurrentValue.u8 == 2 || dpd.CurrentValue.u8 == 3) {
+-					GP_LOG_D ("SONY Property change seen, 0xd213... ending press");
++		/* hold S2 until the camera registers the shot: at least 150 ms, at most 1000 ms */
++		while (time_since (full_start) < 1000) {
++			if (!shot) {
++				ret = ptp_check_event (params);
++				if (ret != PTP_RC_OK) {
++					GP_LOG_E ("sony trigger: check_event failed 0x%04x while holding", ret);
+ 					break;
+ 				}
+-			} while (time_since (event_start) < 1000);
++				while (nheld < maxheld && ptp_get_one_event (params, &event)) {
++					if (event.Code == PTP_EC_Sony_AFStatus)
++						continue;
++					if ((event.Code == PTP_EC_Sony_DevicePropChanged) && (event.Param1 == PTP_DPC_SONY_FocusFound))
++						continue;
++					if ((event.Code == PTP_EC_Sony_ObjectAdded) || (event.Code == PTP_EC_Sony_CapturedEvent)) {
++						GP_LOG_D ("sony trigger: event 0x%04x after %d ms", event.Code, time_since (full_start));
++						shot = 1;
++					}
++					held[nheld++] = event;
++				}
++				if (!shot) {
++					if (ptp_sony_getalldevicepropdesc (params) != PTP_RC_OK) /* avoid caching */
++						break;
++					if (ptp_generic_getdevicepropdesc (params, PTP_DPC_SONY_ObjectInMemory, &dpd) == PTP_RC_OK) {
++						inmem = dpd.CurrentValue.u16;
++						ptp_free_devicepropdesc (&dpd);
++						if (inmem >= 0x8000) /* the image is in the camera's RAM */
++							shot = 1;
++					}
++				}
++				if (shot)
++					GP_LOG_D ("sony trigger: shot registered after %d ms (0xd215=0x%x)", time_since (full_start), inmem);
++			}
++			if (shot && time_since (full_start) >= 150)
++				break;
++			usleep (20*1000);
+ 		}
+-		ptp_free_devicepropdesc(&dpd);
+-		GP_LOG_D ("releasing shutterbutton");
++		if (!shot)
++			GP_LOG_D ("sony trigger: no shot registered after %d ms (0xd215=0x%x)", time_since (full_start), inmem);
+ 
+ 		/* release full-press */
+ 		propval.u16 = 1;
+-		C_PTP (ptp_sony_setdevicecontrolvalueb (params, PTP_DPC_SONY_ShutterRelease, &propval, PTP_DTC_UINT16));
++		ret = ptp_sony_setdevicecontrolvalueb (params, PTP_DPC_SONY_ShutterRelease, &propval, PTP_DTC_UINT16);
++		if (ret != PTP_RC_OK && fail == PTP_RC_OK)
++			fail = ret;
++		GP_LOG_D ("sony trigger: released after %d ms (%d ms from half-press)", time_since (full_start), time_since (press_start));
+ 
++sony_release_half:
+ 		/* release half-press */
+ 		propval.u16 = 1;
+-		C_PTP (ptp_sony_setdevicecontrolvalueb (params, PTP_DPC_SONY_ShutterHalfRelease, &propval, PTP_DTC_UINT16));
++		ret = ptp_sony_setdevicecontrolvalueb (params, PTP_DPC_SONY_ShutterHalfRelease, &propval, PTP_DTC_UINT16);
++		if (ret != PTP_RC_OK && fail == PTP_RC_OK)
++			fail = ret;
+ 
++sony_requeue:
++		for (i = 0; i < nheld; i++)
++			ptp_add_event (params, &held[i]);
++		C_PTP (fail);
+ 		return GP_OK;
+ 	}
+ 

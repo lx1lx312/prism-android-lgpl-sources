@@ -1,0 +1,17 @@
+Sony live view (camera_capture_preview, PTP_VENDOR_SONY): the PTPObjectInfo of the live view object 0xffffc002 is
+a stack variable that ptp_unpack_OI leaves untouched when GetObjectInfo answers OK with a short or empty data phase
+(len < PTP_oi_filenamelen + 5); the "ret == PTP_RC_OK" branch then frees its garbage Filename / Keywords and the
+camera service aborts (Prism, ILME-FX30 on the ImageCaptureCore pass-through, 30/09/2026 22:00, [FB 1a0f4549]).
+Zero it before every GetObjectInfo.
+--- a/camlibs/ptp2/library.c
++++ b/camlibs/ptp2/library.c
+@@ -3884,6 +3884,9 @@
+ 		do {
+ 			PTPObjectInfo oi;
+ 
++			/* Prism: ptp_unpack_OI returns without touching oi when the data phase is short or empty,
++			 * then ptp_free_objectinfo frees stack garbage (abort). */
++			memset (&oi, 0, sizeof (oi));
+ 			/* This state can persist for up to 1 second on the ZV-1 */
+ 			ret = ptp_getobjectinfo(params, preview_object, &oi);
+ 			if (ret == PTP_RC_InvalidObjectHandle) {

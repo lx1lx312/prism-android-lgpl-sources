@@ -1,0 +1,15 @@
+Sony "Capture Target" (PTP_DPC_SONY_StillImageStoreDestination 0xd222) is a UINT16 property on the bodies
+Prism measured (ILME-FX30, 30/09/2026: "Type of property Capture Target expected: 0x0000 got: 0x0004").
+config.c declares datatype 0, so _set_config packs NO value and SetExtDevicePropValue (0x9205) goes out with an
+empty data phase: ImageCaptureCore pass-through answers after ~60 s and the write fails. Declare the real type.
+--- a/camlibs/ptp2/config.c
++++ b/camlibs/ptp2/config.c
+@@ -11584,7 +11584,7 @@
+ 	{ N_("Autofocus"),              "autofocus",    0,  PTP_VENDOR_NIKON,   0,  _get_Autofocus,         _put_Autofocus },
+ 	{ N_("Capture Target"),         "capturetarget",0,  PTP_VENDOR_CANON,   0,  _get_CaptureTarget,     _put_CaptureTarget },
+ 	{ N_("Capture Target"),         "capturetarget",0,  PTP_VENDOR_PANASONIC,0, _get_CaptureTarget,     _put_CaptureTarget },
+-	{ N_("Capture Target"),         "capturetarget",PTP_DPC_SONY_StillImageStoreDestination,  PTP_VENDOR_SONY,0, _get_Sony_CaptureTarget, _put_Sony_CaptureTarget },
++	{ N_("Capture Target"),         "capturetarget",PTP_DPC_SONY_StillImageStoreDestination,  PTP_VENDOR_SONY,PTP_DTC_UINT16, _get_Sony_CaptureTarget, _put_Sony_CaptureTarget },
+ 	{ N_("CHDK"),                   "chdk",         PTP_OC_CHDK,  PTP_VENDOR_CANON, 0, _get_CHDK,       _put_CHDK },
+ 	{ N_("Capture"),                "capture",      0,  PTP_VENDOR_CANON,   0,  _get_Canon_CaptureMode, _put_Canon_CaptureMode },
+ 	{ N_("Remote Mode"),            "remotemode",   PTP_OC_CANON_EOS_SetRemoteMode, PTP_VENDOR_CANON, 0, _get_Canon_RemoteMode, _put_Canon_RemoteMode },

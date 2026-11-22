@@ -1,0 +1,28 @@
+[package]
+name = "rawler-ffi"
+version = "0.1.0"
+# edition 2024 (needs rustc >= 1.85; rawler itself is 2024 / 1.89) — the TIFF IFD
+# walk below uses let-chains, which are edition-2024 only.
+edition = "2024"
+description = "Thin C FFI over rawler (the pure-Rust RAW decoder behind DngLab/RapidRAW): a camera RAW file becomes a linear f32 RGB buffer with orientation applied, plus its embedded preview JPEG. Shared by ImageBrowser and Photo Editor Pro; platform-neutral (macOS + Windows)."
+license = "LGPL-2.1"
+publish = false
+
+[lib]
+name = "rawler_ffi"
+# staticlib → a single .a the Xcode project links (arm64, mirroring skia-metal).
+# PR-WIN: cdylib su Windows -> rawler_ffi.dll (rawler e' LGPL-2.1: solo link dinamico, D9), caricata a
+# runtime da core/platform/win/rawler_loader.cpp; la costruisce scripts/build-rawler.cmd fuori dal CMake.
+crate-type = ["cdylib"]
+
+[dependencies]
+rawler = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# NOTE: deliberately NOT panic = "abort" (vtracer-ffi does that). Every ABI entry
+# point wraps its body in catch_unwind so a decoder panic on a malformed RAW turns
+# into a NULL return instead of killing the host app — that needs unwinding.
+panic = "unwind"

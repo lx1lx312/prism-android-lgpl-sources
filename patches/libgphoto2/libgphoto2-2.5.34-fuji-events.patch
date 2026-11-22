@@ -1,0 +1,149 @@
+--- a/camlibs/ptp2/library.c
++++ b/camlibs/ptp2/library.c
+@@ -5324,6 +5324,8 @@
+ 	uint32_t		newobject = 0, newobject2 = 0;
+ 	PTPContainer		event, newevent;
+ 	struct timeval		event_start;
++	struct timeval		af_start;
++	int			af_timed_out = 0;
+ 	int			back_off_wait = 0;
+ 	unsigned int		waittime = 35*1000;
+ 
+@@ -5374,27 +5376,45 @@
+ 
+ 	C_PTP_REP (ptp_initiatecapture(params, 0x00000000, 0x00000000));
+ 
+-	/* poll camera until it is ready */
++	/* Poll at most 20 times per second; an AF failure must not hold the
++	 * camera in a half-press indefinitely or flood it with status requests. */
++	af_start = time_now();
+ 	propval.u16 = 0x0001;
+ 	while (propval.u16 == 0x0001) {
+ 		C_PTP (ptp_getdevicepropvalue (params, PTP_DPC_FUJI_AFStatus, &propval, PTP_DTC_UINT16));
+ 		GP_LOG_D ("XXX Ready to shoot? %X", propval.u16);
++		if (propval.u16 != 0x0001)
++			break;
++		if (time_since (af_start) >= 10*1000) {
++			af_timed_out = 1;
++			break;
++		}
++		usleep (50*1000);
+ 	}
+ 
+ 	/* 2 - means OK apparently, 3 - means failed and initiatecapture will get busy. */
+-	if (propval.u16 == 3) { /* reported on out of focus */
+-		gp_context_error (context, _("Fuji Capture failed: Perhaps no auto-focus?"));
+-
++	if (af_timed_out || propval.u16 == 3) {
++		uint16_t release_ret;
++
++		if (af_timed_out)
++			gp_context_error (context, _("Fuji autofocus timed out."));
++		else
++			gp_context_error (context, _("Fuji Capture failed: Perhaps no auto-focus?"));
++
++		/* Reuse the failed-AF release sequence, preserving the original failure
++		 * even if cleanup fails. Do not issue the shoot command after a timeout. */
++		free_array (&beforehandles);
+ 		propval.u16 = 0x0004;
+-		C_PTP_REP (ptp_setdevicepropvalue (params, 0xd208, &propval, PTP_DTC_UINT16));
+-		C_PTP_REP (ptp_initiatecapture(params, 0x00000000, 0x00000000));
++		release_ret = LOG_ON_PTP_E (ptp_setdevicepropvalue (params, 0xd208, &propval, PTP_DTC_UINT16));
++		if (release_ret == PTP_RC_OK)
++			LOG_ON_PTP_E (ptp_initiatecapture(params, 0x00000000, 0x00000000));
+ 
+ 		if (have_prop(camera, params->deviceinfo.VendorExtensionID, PTP_DPC_FUJI_PriorityMode)) {
+ 			propval.u16 = 0x0001;
+ 			LOG_ON_PTP_E (ptp_setdevicepropvalue (params, PTP_DPC_FUJI_PriorityMode, &propval, PTP_DTC_UINT16));
+ 		}
+ 
+-		return GP_ERROR;
++		return af_timed_out ? GP_ERROR_TIMEOUT : GP_ERROR;
+ 	}
+ 
+ 	/* shoot */
+@@ -5429,6 +5449,9 @@
+ 			switch (event.Code) {
+ 				case PTP_EC_ObjectAdded:
+ 				case PTP_EC_FUJI_ObjectAdded:
++					/* A preview event can arrive after liveview has stopped. */
++					if (event.Param1 == 0x80000001)
++						continue;
+ 					GP_LOG_D ("Event Code %04x, Param 1 %08x", event.Code, event.Param1);
+ 					ret = ptp_object_want (params, event.Param1, PTPOBJECT_OBJECTINFO_LOADED, &ob);
+ 					if (ret != PTP_RC_OK) {
+@@ -5482,6 +5505,10 @@
+ 		for_each (uint32_t*, phandle, handles) {
+ 			unsigned int 	j;
+ 			PTPObject	*ob;
++
++			/* The reserved liveview object is never a captured still. */
++			if (*phandle == 0x80000001)
++				continue;
+ 
+ 			/* look if we saw the objecthandle before capture */
+ 			for (j=0;j<beforehandles.len;j++)
+@@ -7215,8 +7242,9 @@
+ 	) {
+ 		PTPPropValue propval;
+ 
+-		/* reenable event wait mode */
+-		if (have_prop(camera, params->deviceinfo.VendorExtensionID, PTP_DPC_FUJI_PriorityMode)) {
++		/* Reenable event wait mode outside liveview. Changing priority during
++		 * open capture is rejected as Busy; still poll handles/events below. */
++		if (!params->inliveview && have_prop(camera, params->deviceinfo.VendorExtensionID, PTP_DPC_FUJI_PriorityMode)) {
+ 			propval.u16 = 0x0001;
+ 			LOG_ON_PTP_E (ptp_setdevicepropvalue (params, PTP_DPC_FUJI_PriorityMode, &propval, PTP_DTC_UINT16));
+ 		}
+@@ -7233,15 +7261,23 @@
+ 				PTPObject	*ob;
+ 				PTPObjectInfo	oi;
+ 
+-				if (params->inliveview == 1 && *phandle == 0x80000001) /* Ignore preview image object handle while liveview is active */
++				if (*phandle == 0x80000001) /* Fuji reserves this handle for the preview, even after liveview stops. */
+ 					continue;
+ 				if (PTP_RC_OK == ptp_find_object_in_cache (params, *phandle, &ob)) /* already have it */
+ 					continue;
+ 				/* might be a just deleted entry , seen in https://github.com/gphoto/gphoto2/issues/456 */
+ 				memset (&oi,0,sizeof(oi));
+-				if (PTP_RC_DeviceBusy == ptp_getobjectinfo (params, *phandle, &oi))
++				ret = ptp_getobjectinfo (params, *phandle, &oi);
++				ptp_free_objectinfo (&oi);
++				/* Fuji can keep stale handles after deletion. Only announce objects
++				 * whose metadata is readable; retry inaccessible ones on a later poll. */
++				if (ret == PTP_RC_DeviceBusy || ret == PTP_RC_AccessDenied ||
++				    ret == PTP_RC_InvalidObjectHandle)
+ 					continue;
+-				ptp_free_objectinfo (&oi);
++				if (ret != PTP_RC_OK) {
++					free_array (&handles);
++					C_PTP_REP (ret);
++				}
+ 				event.Code = PTP_EC_ObjectAdded;
+ 				event.Param1 = *phandle;
+ 				free_array (&handles);
+@@ -7445,6 +7481,14 @@
+ 	case PTP_EC_ObjectAdded: {
+ 		PTPObject	*ob;
+ 
++		/* Fuji also reports real ObjectAdded events for its preview image.
++		 * Those must never become downloadable still captures. */
++		if (params->deviceinfo.VendorExtensionID == PTP_VENDOR_FUJI &&
++		    event.Param1 == 0x80000001) {
++			*eventtype = GP_EVENT_TIMEOUT;
++			*eventdata = NULL;
++			return GP_OK;
++		}
+ 		C_MEM (path = calloc(1, sizeof(CameraFilePath)));
+ 
+ 		CR (add_object_to_fs_and_path (camera, event.Param1, path, context));
+@@ -8154,6 +8198,9 @@
+ 
+ 	for_each (uint32_t*, phandle, handles) {
+ 		PTPObject	*ob;
++		/* Do not expose Fuji's preview as a file when listing/recovering camera RAM. */
++		if (params->deviceinfo.VendorExtensionID == PTP_VENDOR_FUJI && *phandle == 0x80000001)
++			continue;
+ 		if (PTP_RC_OK != ptp_object_want (params, *phandle, PTPOBJECT_PARENTOBJECT_LOADED, &ob)) { // refresh
+ 			GP_LOG_D ("could not find object 0x%08x, possibly deleted on camera", *phandle);
+ 			continue; /* object might have been deleted but ObjectRemoved event not handled, yet */
